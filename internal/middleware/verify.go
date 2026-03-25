@@ -8,10 +8,15 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
-const cloudflareSignatureHeader = "Cf-Webhook-Signature"
+const (
+	cloudflareSignatureHeader = "Cf-Webhook-Signature"
+	signatureTimeTolerance    = 5 * time.Minute
+)
 
 func VerifyWebhookSignature(secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -70,17 +75,15 @@ func isValidSignature(signatureHeader string, body []byte, secret string) bool {
 		return false
 	}
 
-	/*
-		ts, err := strconv.ParseInt(sigTimestamp, 10, 64)
-		if err != nil {
-			log.Printf("WARN: Failed to parse timestamp '%s' from signature header: %v", sigTimestamp, err)
-			return false
-		}
-		if time.Since(time.Unix(ts, 0)) > 5*time.Minute {
-			log.Printf("WARN: Webhook timestamp %s is too old (outside tolerance window)", sigTimestamp)
-			return false
-		}
-	*/
+	ts, err := strconv.ParseInt(sigTimestamp, 10, 64)
+	if err != nil {
+		log.Printf("WARN: Failed to parse timestamp '%s' from signature header: %v", sigTimestamp, err)
+		return false
+	}
+	if time.Since(time.Unix(ts, 0)) > signatureTimeTolerance {
+		log.Printf("WARN: Webhook timestamp %s is too old (outside %v tolerance window)", sigTimestamp, signatureTimeTolerance)
+		return false
+	}
 
 	receivedSig, err := hex.DecodeString(sigHex)
 	if err != nil {

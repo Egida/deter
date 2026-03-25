@@ -1,106 +1,84 @@
-# Deter - a DDOS mitigation tool for Cloudflare
+# Deter
 
 [![Go Build](https://github.com/malwarebo/deter/actions/workflows/go-build.yml/badge.svg)](https://github.com/malwarebo/deter/actions/workflows/go-build.yml)
 
-Deter automatically responds to Cloudflare DDoS attack alerts by applying preconfigured mitigation strategies.
+Automated DDoS mitigation for Cloudflare. Listens for Cloudflare DDoS webhook alerts, flips the zone into "Under Attack" mode, and signals a Cloudflare Worker to serve SHA-256 proof-of-work challenges to visitors until the attack ends.
 
-## Overview
-
-Deter consists of two main components:
-
-1. **Deter Server**: Application that receives Cloudflare webhook notifications about DDoS attacks and triggers appropriate security responses.
-2. **Deter Worker**: A Cloudflare Worker that implements client-side challenges (e.g., proof-of-work) during active attacks.
-
-Together, these components create a defense system that can:
-
-- Automatically detect DDoS attacks via Cloudflare webhooks
-- Apply appropriate security measures when attacks begin
-- Scale back security measures when attacks end
-- Apply client-side challenges to suspected malicious users
-
-## Architecture
+## How it works
 
 ```
-┌───────────────┐    Webhook    ┌─────────────────┐    API     ┌───────────────┐
-│   Cloudflare  │ ────────────> │  Deter Server   │ ─────────> │   Cloudflare  │
-│               │ <───────────  │                 │ <───────── │   API         │
-└───────────────┘  HTTP 200 OK  └─────────────────┘            └───────────────┘
-                                        │
-                                        │ KV Write
-                                        ▼
-                                ┌─────────────────┐
-                                │  KV Namespace   │
-                                └─────────────────┘
-                                        │
-                                        │ KV Read
-                                        ▼
-┌───────────────┐     HTTP      ┌─────────────────┐
-│    Browser    │ <────────────>│  Deter Worker   │
-└───────────────┘                └─────────────────┘
+Cloudflare ──webhook──▶ Deter Server ──API──▶ Cloudflare (set "under_attack")
+                              │
+                              ▼
+                         Workers KV (attack status)
+                              │
+                              ▼
+                        Deter Worker ◀──HTTP──▶ Browser (PoW challenge)
 ```
 
-## Features
+1. Cloudflare sends a DDoS alert webhook to the server.
+2. The server verifies the HMAC signature, parses the payload, and calls the Cloudflare API to set the zone's security level to `under_attack`.
+3. It writes an `active` status to Workers KV so the edge worker knows an attack is happening.
+4. The worker reads KV on each request. If active, it serves a proof-of-work challenge page. The browser computes a SHA-256 hash with the required difficulty, submits it back, and gets an HMAC-signed cookie that bypasses the challenge for 1 hour.
+5. When the attack ends, Cloudflare sends another webhook. The server reverts the security level and sets KV to `inactive`.
 
-- Webhook signature verification for security
-- Automatic "Under Attack Mode" activation during attacks
-- KV-based signaling between server and worker
-- Configurable security levels and mitigations
-- Client-side proof-of-work challenges via Workers
-- Graceful shutdown for the server
+Duplicate webhooks for the same zone are skipped (in-memory idempotency). Webhook timestamps older than 5 minutes are rejected to prevent replay attacks.
 
-## Setup and Configuration
+## Running the server
 
-### Server Requirements
-
-- Go 1.18 or higher
-- Cloudflare API Token with appropriate permissions
-- Cloudflare Webhook endpoint configured
-
-### Configuration (Environment Variables)
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `CF_WEBHOOK_SECRET` | Secret for verifying webhook signatures | Yes |
-| `CF_API_TOKEN` | Cloudflare API token | Yes |
-| `CF_ACCOUNT_ID` | Cloudflare account ID | Yes |
-| `TARGET_ZONE_ID` | Zone ID to protect | Yes |
-| `KV_NAMESPACE_ID` | KV namespace for state sharing | Yes |
-| `LISTEN_ADDR` | Server listen address (default: `:8080`) | No |
-| `DEFAULT_SEC_LEVEL` | Default security level (default: `medium`) | No |
-| `KV_KEY_PREFIX` | Prefix for KV keys (default: `attack_status_zone_`) | No |
-| `WEBHOOK_TIMEOUT_SECONDS` | Webhook processing timeout (default: `30`) | No |
-
-### Worker Setup
-
-1. Copy the worker code to your Cloudflare Worker
-2. Configure `wrangler.toml` with your account/zone details
-3. Create a KV namespace and update your worker configuration
-
-## Running the Server
+Requires Go 1.23+.
 
 ```bash
-# Build the server
 go build -o deter-server ./cmd/deter-server
 
-# Run with environment variables set
-export CF_WEBHOOK_SECRET="your-webhook-secret"
-export CF_API_TOKEN="your-cf-api-token" 
+export CF_API_TOKEN="your-cf-api-token"
 export CF_ACCOUNT_ID="your-account-id"
 export TARGET_ZONE_ID="your-zone-id"
 export KV_NAMESPACE_ID="your-kv-namespace-id"
+export CF_WEBHOOK_SECRET="your-webhook-secret"
 ./deter-server
 ```
 
-## API Reference
+## Deploying the worker
 
-### Webhook Endpoint
+Requires [Wrangler](https://developers.cloudflare.com/workers/wrangler/).
 
-**POST** `/cloudflare-webhook`
+1. Edit `worker/wrangler.toml` with your account ID, zone ID, and KV namespace ID.
+2. Deploy:
 
-This endpoint receives DDoS event notifications from Cloudflare. Headers must include a valid `Cf-Webhook-Signature` for verification.
+```bash
+cd worker
+npx wrangler deploy
+```
 
-## Security Considerations
+## Configuration
 
-- Always use webhook signature verification in production
-- Configure appropriate Cloudflare API token permissions
-- Consider implementing timestamp validation to prevent replay attacks
+### Server (environment variables)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CF_API_TOKEN` | Cloudflare API token | *required* |
+| `CF_ACCOUNT_ID` | Cloudflare account ID | *required* |
+| `TARGET_ZONE_ID` | Zone ID to protect | *required* |
+| `KV_NAMESPACE_ID` | KV namespace for attack status | *required* |
+| `CF_WEBHOOK_SECRET` | HMAC secret for webhook signature verification | empty (verification skipped) |
+| `LISTEN_ADDR` | Server listen address | `:8080` |
+| `DEFAULT_SEC_LEVEL` | Security level to revert to after attack | `medium` |
+| `KV_KEY_PREFIX` | Prefix for KV keys | `attack_status_zone_` |
+| `WEBHOOK_TIMEOUT_SECONDS` | Timeout for webhook processing | `30` |
+
+### Worker (wrangler.toml / env vars)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TARGET_ZONE_ID` | Zone ID (must match server config) | *required* |
+| `KV_NAMESPACE` | KV namespace binding | *required* |
+| `POW_DIFFICULTY` | Number of leading hex zeros required | `4` |
+| `POW_SECRET` | HMAC secret for session cookies | `deter-pow-secret` |
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/cloudflare-webhook` | Receives Cloudflare DDoS alert webhooks |
+| `GET` | `/health` | Returns `200 OK` |

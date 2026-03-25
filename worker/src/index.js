@@ -1,253 +1,238 @@
-// Example Worker Script (worker.js)
-
-// Configuration (Ensure these are set in wrangler.toml or Dashboard environment variables)
-// - TARGET_ZONE_ID: Your Cloudflare Zone ID (used to construct KV key)
-// - KV_NAMESPACE: Binding name for your KV Namespace (e.g., ATTACK_STATUS_KV)
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Avoid applying logic to non-page assets if desired (optional)
-    // if (url.pathname.match(/\.(css|js|jpg|png|gif|ico)$/)) {
-    //   return fetch(request);
-    // }
-
-    // --- Determine Attack Status ---
-    let attackStatus = "inactive"; // Default: assume safe
     const zoneId = env.TARGET_ZONE_ID;
-    const kvBinding = env.KV_NAMESPACE; // Use the binding name configured
+    const kvBinding = env.KV_NAMESPACE;
 
-    if (!zoneId) {
-      console.error(
-        "Worker ERROR: TARGET_ZONE_ID environment variable not set!"
-      );
-      // Fail open or closed? For security, might challenge/block if config missing
-      // return new Response("Configuration Error", { status: 500 });
-    }
-    if (!kvBinding) {
-      console.error("Worker ERROR: KV Namespace binding not configured!");
-      // return new Response("Configuration Error", { status: 500 });
+    if (!zoneId || !kvBinding) {
+      console.error("Worker ERROR: TARGET_ZONE_ID or KV_NAMESPACE binding not configured");
+      return fetch(request);
     }
 
     const kvKey = `attack_status_zone_${zoneId}`;
-    let kvReadError = false;
+    let attackStatus = "inactive";
 
-    if (zoneId && kvBinding) {
-      try {
-        const status = await kvBinding.get(kvKey);
-        if (status === "active") {
-          attackStatus = "active";
-          console.log(`Worker INFO: KV Status for ${kvKey} is 'active'.`);
-        } else {
-          console.log(
-            `Worker INFO: KV Status for ${kvKey} is '${status}'. Treating as inactive.`
-          );
-        }
-      } catch (e) {
-        console.error(`Worker ERROR: KV GET failed for key ${kvKey}: ${e}`);
-        kvReadError = true;
-        // Decide how to handle KV errors: fail open (inactive) or fail closed (active)?
-        // Failing open might be safer for user experience, but less secure during actual failure.
-        // attackStatus = 'active'; // Example: Fail closed (treat as attack)
+    try {
+      const status = await kvBinding.get(kvKey);
+      if (status === "active") {
+        attackStatus = "active";
       }
-    } else {
-      attackStatus = "inactive"; // Cannot check status if config is missing
-      console.error(
-        "Worker WARN: Cannot check attack status due to missing config. Assuming inactive."
-      );
+    } catch (e) {
+      console.error(`Worker ERROR: KV GET failed for key ${kvKey}: ${e}`);
+      return fetch(request);
     }
 
-    // --- Apply Mitigation if Attack Active ---
-    if (attackStatus === "active") {
-      console.log(
-        `Worker INFO: Attack ACTIVE for ${url.pathname}. Applying mitigation.`
-      );
-
-      // --- Mitigation Option: Simple Proof-of-Work (Conceptual Example) ---
-      // This requires client-side JS to solve and resubmit. A library like 'hashcash-browser'
-      // or a custom implementation would be needed for a real solution.
-      // This example just shows the flow: Check for solution, if missing, send challenge.
-
-      const powHeader = "X-Pow-Solution";
-      const solution = request.headers.get(powHeader);
-
-      // Basic check - Needs proper validation logic!
-      if (solution && solution.startsWith("solved:")) {
-        console.log(
-          `Worker INFO: Received potential PoW solution. Allowing request (validation needed).`
-        );
-        // Allow request to proceed to origin/cache AFTER validation
-        return fetch(request);
-      } else {
-        // Send PoW Challenge HTML/JS
-        console.log(
-          `Worker INFO: No valid PoW solution found. Sending challenge page.`
-        );
-        const difficulty = 20; // Example difficulty
-        const challengeNonce = Math.random().toString(36).substring(2); // Unique nonce per challenge
-
-        const challengeHtml = generatePowChallengeHtml(
-          request.method,
-          url.href,
-          difficulty,
-          challengeNonce,
-          powHeader
-        );
-        return new Response(challengeHtml, {
-          status: 403, // Forbidden - Requires action
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control":
-              "no-store, no-cache, must-revalidate, proxy-revalidate", // Prevent caching of challenge
-            Pragma: "no-cache",
-            Expires: "0",
-          },
-        });
-      }
-
-      // --- Mitigation Option 2: Trigger Cloudflare Managed Challenge (Requires Enterprise Plan typically) ---
-      /*
-      console.log(`Worker INFO: Triggering Cloudflare Managed Challenge for ${url.pathname}`);
-      // This often involves returning a specific response that CF interprets
-      // It might be a 403 status with specific headers, or using Firewall Rules triggered by Go.
-      // The simplest might be the Go app enabling a Firewall Rule with action "managed_challenge".
-      // If you *can* trigger from Worker:
-      return new Response('Managed Challenge Required', {
-          status: 403, // Check CF docs for correct status/headers
-          // headers: { 'X-CF-Enable-Managed-Challenge': 'true' } // Hypothetical header
-      });
-      */
-
-      // --- Mitigation Option 3: Trigger Cloudflare Turnstile (Recommended over CAPTCHA) ---
-      /*
-      console.log(`Worker INFO: Presenting Cloudflare Turnstile challenge for ${url.pathname}`);
-      // You'd typically embed the Turnstile widget JS/HTML snippet here.
-      // The verification happens server-side (either in this worker on a subsequent request,
-      // or passed to your origin). This is more complex than simple PoW.
-      const turnstileSiteKey = env.TURNSTILE_SITE_KEY; // Needs env var
-      if (!turnstileSiteKey) return new Response("Turnstile not configured", { status: 500 });
-
-      const turnstileHtml = `... HTML with Turnstile widget using site key ${turnstileSiteKey} ...`;
-      return new Response(turnstileHtml, { status: 403, headers: { 'Content-Type': 'text/html'} });
-      */
-    } else {
-      // Attack status is inactive, proceed normally
-      // console.log(`Worker INFO: Attack INACTIVE for ${url.pathname}. Proceeding.`);
-      return fetch(request); // Forward request to origin or cache
+    if (attackStatus !== "active") {
+      return fetch(request);
     }
+
+    const powCookie = parseCookie(request.headers.get("Cookie") || "", "deter_pow");
+    if (powCookie && await verifyPowToken(powCookie, env.POW_SECRET || "deter-pow-secret")) {
+      return fetch(request);
+    }
+
+    if (request.method === "POST" && url.pathname === "/__deter/verify") {
+      return handleVerification(request, env);
+    }
+
+    const difficulty = parseInt(env.POW_DIFFICULTY || "4", 10);
+    const nonce = crypto.randomUUID();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const challengeData = `${nonce}:${timestamp}`;
+
+    return new Response(generateChallengeHtml(challengeData, difficulty), {
+      status: 403,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
   },
 };
 
-// --- Helper Function for Conceptual PoW Challenge Page ---
-function generatePowChallengeHtml(
-  method,
-  originalUrl,
-  difficulty,
-  nonce,
-  solutionHeader
-) {
-  // IMPORTANT: This client-side PoW is basic and illustrative.
-  // Use robust libraries for actual hashing and difficulty adjustment.
-  // This example simulates work with setTimeout.
-  return `
-<!DOCTYPE html>
+async function handleVerification(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid request", { status: 400 });
+  }
+
+  const { challenge, counter, hash } = body;
+  if (!challenge || counter === undefined || !hash) {
+    return new Response("Missing fields", { status: 400 });
+  }
+
+  const parts = challenge.split(":");
+  if (parts.length !== 2) {
+    return new Response("Invalid challenge", { status: 400 });
+  }
+
+  const timestamp = parseInt(parts[1], 10);
+  const now = Math.floor(Date.now() / 1000);
+  if (now - timestamp > 300) {
+    return new Response("Challenge expired", { status: 403 });
+  }
+
+  const difficulty = parseInt(env.POW_DIFFICULTY || "4", 10);
+  const input = `${challenge}:${counter}`;
+  const computed = await sha256Hex(input);
+
+  if (computed !== hash) {
+    return new Response("Hash mismatch", { status: 403 });
+  }
+
+  if (!computed.startsWith("0".repeat(difficulty))) {
+    return new Response("Insufficient difficulty", { status: 403 });
+  }
+
+  const token = await createPowToken(env.POW_SECRET || "deter-pow-secret");
+
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Set-Cookie": `deter_pow=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=3600`,
+    },
+  });
+}
+
+async function sha256Hex(message) {
+  const data = new TextEncoder().encode(message);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function createPowToken(secret) {
+  const expires = Math.floor(Date.now() / 1000) + 3600;
+  const payload = `pow:${expires}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
+  const sigHex = Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${payload}:${sigHex}`;
+}
+
+async function verifyPowToken(token, secret) {
+  const parts = token.split(":");
+  if (parts.length !== 3) return false;
+
+  const [prefix, expiresStr, sigHex] = parts;
+  if (prefix !== "pow") return false;
+
+  const expires = parseInt(expiresStr, 10);
+  if (isNaN(expires) || Math.floor(Date.now() / 1000) > expires) return false;
+
+  const payload = `${prefix}:${expiresStr}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const sigBuf = new Uint8Array(sigHex.match(/.{2}/g).map((b) => parseInt(b, 16)));
+  return crypto.subtle.verify("HMAC", key, sigBuf, new TextEncoder().encode(payload));
+}
+
+function parseCookie(cookieHeader, name) {
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return match ? match[1] : null;
+}
+
+function generateChallengeHtml(challenge, difficulty) {
+  return `<!DOCTYPE html>
 <html>
 <head>
     <title>Verifying Connection</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>body{font-family: sans-serif; padding: 20px;}</style>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+             display: flex; align-items: center; justify-content: center;
+             min-height: 100vh; background: #f5f5f5; color: #333; }
+      .card { background: #fff; border-radius: 8px; padding: 2rem; max-width: 400px;
+              width: 90%; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; }
+      h1 { font-size: 1.25rem; margin-bottom: 1rem; }
+      #status { color: #666; margin-bottom: 1rem; font-size: 0.9rem; }
+      progress { width: 100%; height: 6px; border-radius: 3px; appearance: none; }
+      progress::-webkit-progress-bar { background: #eee; border-radius: 3px; }
+      progress::-webkit-progress-value { background: #4a90d9; border-radius: 3px; }
+      .error { color: #c0392b; }
+    </style>
 </head>
 <body>
-    <h1>Verifying your connection...</h1>
-    <p>This page helps protect against automated attacks. Please wait.</p>
-    <p id="status">Starting security check...</p>
-    <progress id="progress" max="100" value="0"></progress>
-
+    <div class="card">
+        <h1>Verifying your connection</h1>
+        <p id="status">Starting security check...</p>
+        <progress id="progress" max="100" value="0"></progress>
+    </div>
     <script>
-      const difficulty = ${difficulty}; // How many leading zeros (example)
-      const nonce = "${nonce}";
-      const originalUrl = "${originalUrl}";
-      const solutionHeader = "${solutionHeader}";
-      const method = "${method}"; // Original request method
+      const CHALLENGE = "${challenge}";
+      const DIFFICULTY = ${difficulty};
+      const TARGET = "0".repeat(DIFFICULTY);
 
-      async function solveChallenge() {
-        const statusEl = document.getElementById('status');
-        const progressEl = document.getElementById('progress');
-        statusEl.textContent = 'Performing security check... (Difficulty: ${difficulty})';
-
-        console.log('Starting PoW calculation...');
-        let counter = 0;
-        let solution = '';
-        const targetPrefix = '0'.repeat(difficulty); // Simplified target
-
-        // Simulate finding a hash with leading zeros (replace with real crypto hash)
-        const startTime = Date.now();
-        while (true) {
-            counter++;
-            const dataToHash = nonce + ':' + counter;
-            // In real PoW, hash dataToHash (e.g., SHA-256)
-            // const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(dataToHash));
-            // const hashHex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
-
-            // *** SIMULATION ***
-            const simulatedHash = Math.random().toString(16).substring(2); // Fake hash
-            if (counter % 1000 === 0) { // Update progress periodically
-                 progressEl.value = (counter / (1000 * difficulty)) * 100 % 100; // Very rough progress
-                 await new Promise(resolve => setTimeout(resolve, 1)); // Prevent blocking UI thread
-            }
-
-            // Replace with actual hash check: if (hashHex.startsWith(targetPrefix))
-            if (Math.random() < 0.00001 * (15/difficulty) ) { // Simulate finding solution eventually
-                solution = 'solved:' + nonce + ':' + counter; // Example solution format
-                console.log('PoW solution found:', solution);
-                break;
-            }
-             if (Date.now() - startTime > 20000) { // Timeout
-                 statusEl.textContent = 'Verification timed out. Please reload.';
-                 console.error('PoW timed out');
-                 return; // Stop trying
-             }
-        }
-
-        statusEl.textContent = 'Verification successful. Reloading page...';
-        progressEl.value = 100;
-
-        // Retry the original request with the solution header
-        try {
-            const headers = new Headers();
-            headers.append(solutionHeader, solution);
-            // Add other necessary headers? Be careful about passing all original headers.
-             headers.append('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8');
-
-
-            const response = await fetch(originalUrl, {
-                method: method, // Use original method
-                headers: headers,
-                redirect: 'manual' // Handle redirects manually if needed based on response
-                // Body handling for POST/PUT etc. is complex from client-side JS like this
-            });
-
-             // Check if the server accepted the solution (e.g., not another 403)
-            if (response.ok || response.status === 302 || response.status === 301) { // Allow OK or redirects
-                 // Replace current page content or redirect
-                 window.location.replace(originalUrl); // Simplest is often to just reload
-             } else {
-                 statusEl.textContent = 'Verification rejected by server (' + response.status + '). Please try reloading.';
-                 console.error('Server rejected PoW solution:', response.status);
-             }
-
-        } catch (err) {
-            statusEl.textContent = 'Failed to submit verification. Please check your connection and reload.';
-            console.error('Fetch error during PoW submission:', err);
-        }
+      async function sha256(msg) {
+        const buf = await crypto.subtle.digest("SHA-256",
+          new TextEncoder().encode(msg));
+        return Array.from(new Uint8Array(buf))
+          .map(b => b.toString(16).padStart(2, "0")).join("");
       }
 
-      // Start the process after slight delay for rendering
-      setTimeout(solveChallenge, 100);
+      async function solve() {
+        const status = document.getElementById("status");
+        const progress = document.getElementById("progress");
+        status.textContent = "Computing proof of work...";
+
+        let counter = 0;
+        const batchSize = 500;
+        const maxIterations = 50_000_000;
+
+        while (counter < maxIterations) {
+          for (let i = 0; i < batchSize; i++) {
+            const input = CHALLENGE + ":" + counter;
+            const hash = await sha256(input);
+            if (hash.startsWith(TARGET)) {
+              status.textContent = "Verified. Redirecting...";
+              progress.value = 100;
+
+              const res = await fetch("/__deter/verify", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ challenge: CHALLENGE, counter, hash }),
+              });
+
+              if (res.ok) {
+                window.location.reload();
+                return;
+              }
+              status.textContent = "Verification rejected. Please reload.";
+              status.className = "error";
+              return;
+            }
+            counter++;
+          }
+          progress.value = Math.min(95, (counter / 100000) * 100);
+          await new Promise(r => setTimeout(r, 0));
+        }
+
+        status.textContent = "Verification timed out. Please reload.";
+        status.className = "error";
+      }
+
+      solve();
     </script>
 </body>
-</html>
-  `;
+</html>`;
 }
