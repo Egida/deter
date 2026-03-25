@@ -26,7 +26,7 @@ Duplicate webhooks for the same zone are skipped (in-memory idempotency). Webhoo
 
 ## Running the server
 
-Requires Go 1.23+.
+Requires Go 1.26+.
 
 ```bash
 go build -o deter-server ./cmd/deter-server

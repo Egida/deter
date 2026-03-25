@@ -1,6 +1,6 @@
 module github.com/malwarebo/deter
 
-go 1.23
+go 1.26.1
 
 require github.com/cloudflare/cloudflare-go v0.115.0
 
