@@ -76,6 +76,45 @@ npx wrangler deploy
 | `POW_DIFFICULTY` | Number of leading hex zeros required | `4` |
 | `POW_SECRET` | HMAC secret for session cookies | `deter-pow-secret` |
 
+## Local testing
+
+Start the server with dummy credentials. Omit `CF_WEBHOOK_SECRET` to skip signature verification:
+
+```bash
+CF_API_TOKEN=dummy CF_ACCOUNT_ID=dummy TARGET_ZONE_ID=zone123 KV_NAMESPACE_ID=dummy go run ./cmd/deter-server
+```
+
+Simulate an attack starting:
+
+```bash
+curl -X POST http://localhost:8080/cloudflare-webhook \
+  -H "Content-Type: application/json" \
+  -d '{"alert_id":"a1","alert_type":"dos","zone_id":"zone123","attack_id":"atk1"}'
+```
+
+Simulate an attack ending:
+
+```bash
+curl -X POST http://localhost:8080/cloudflare-webhook \
+  -H "Content-Type: application/json" \
+  -d '{"alert_id":"a2","alert_type":"dos","zone_id":"zone123","attack_id":"atk1","ended_at":"2026-03-25T12:00:00Z"}'
+```
+
+To test with signature verification:
+
+```bash
+BODY='{"alert_id":"a1","alert_type":"dos","zone_id":"zone123","attack_id":"atk1"}'
+TIMESTAMP=$(date +%s)
+SIG=$(printf '%s.%s' "$TIMESTAMP" "$BODY" | openssl dgst -sha256 -hmac "testsecret" -hex | awk '{print $2}')
+
+curl -X POST http://localhost:8080/cloudflare-webhook \
+  -H "Content-Type: application/json" \
+  -H "Cf-Webhook-Signature: t=$TIMESTAMP,v1=$SIG" \
+  -d "$BODY"
+```
+
+For the worker, use `npx wrangler dev` inside `worker/`. Cloudflare API calls will fail with dummy tokens, but webhook parsing, signature verification, and idempotency all work locally.
+
 ## Endpoints
 
 | Method | Path | Description |
